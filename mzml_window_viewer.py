@@ -1153,6 +1153,19 @@ def _(mo):
             white-space: normal; overflow-wrap: anywhere;
         }
         .plot-note { color: var(--muted); font-size: 0.8rem; margin-top: 4px; }
+        /* Titled divider: a labelled horizontal rule that groups the settings
+           without hiding them behind a click. */
+        .section-rule {
+            display: flex; align-items: center; gap: 10px;
+            margin: 6px 0 2px; color: var(--muted);
+            font-size: 0.78rem; font-weight: 700;
+            letter-spacing: 0.06em; text-transform: uppercase;
+            white-space: nowrap;
+        }
+        .section-rule::after {
+            content: ""; flex: 1 1 auto; height: 1px;
+            background: var(--card-border);
+        }
         /* Flex children default to min-width:auto, which lets the wide data
            editor push the right column past the viewport edge. marimo's stack
            wrappers are inline-styled divs, so force them to be shrinkable;
@@ -1421,12 +1434,65 @@ def _(IndexedMzMLSource, Path, np, tempfile):
                 totals[label] += integrate_window(mz, inten, low, high)
         return totals, grand
 
+    def estimate_native_resolution(source, mz_min, mz_max, ms_level=None):
+        """Native sampling resolution the reader would use for this grid.
+
+        Delegates to the reader's own public estimator rather than
+        re-deriving it. That matters: the reader keys off the *densest*
+        representative spectrum, not a median, so any home-grown median-of-N
+        estimate lands ~1.5% low -- which would let the budget report "fits"
+        for a grid that then blows the cap. Same call, same answer, no drift.
+        """
+        if source is None or source.n_scans == 0:
+            return None
+        try:
+            return float(
+                source.estimate_sampling_resolution(
+                    np.arange(source.n_scans, dtype=np.int64),
+                    mz_min=float(mz_min),
+                    mz_max=float(mz_max),
+                    ms_level=ms_level,
+                )
+            )
+        except Exception:  # noqa: BLE001 - budget display must never break the app
+            return None
+
+    def predict_bins(grid_mode, low, high, resolution, oversampling, fixed_step):
+        """Bin count the reader would produce, without building the grid."""
+        if not (high > low):
+            return None
+        if str(grid_mode) == "auto_resolution":
+            if not resolution or low <= 0 or oversampling <= 0:
+                return None
+            dlog = np.log1p(1.0 / (float(resolution) * float(oversampling)))
+            if not np.isfinite(dlog) or dlog <= 0:
+                return None
+            return int(np.ceil(np.log(high / low) / dlog))
+        if float(fixed_step) <= 0:
+            return None
+        return int(np.ceil((high - low) / float(fixed_step)))
+
+    def fit_oversampling(low, high, resolution, cap, preferred=4.0):
+        """Largest oversampling <= preferred whose grid fits inside `cap` bins.
+
+        Bins scale linearly with oversampling, so solve directly. 2% headroom
+        and a floor to 1 dp keep the answer from landing exactly on the cap.
+        """
+        bins = predict_bins("auto_resolution", low, high, resolution, preferred, 1.0)
+        if bins is None or bins <= cap:
+            return float(preferred)
+        scaled = int(preferred * cap / bins * 0.98 * 10) / 10.0
+        return float(max(1.0, scaled))
+
     return (
         TMPDIR,
         active_windows,
+        estimate_native_resolution,
+        fit_oversampling,
         integrate_window,
         load_source_from_path,
         load_uploaded_source,
+        predict_bins,
         stream_integrate,
         write_temp_mzml,
     )
@@ -1677,13 +1743,40 @@ def _(
 
 
 @app.cell
-def _(card, get_source, help_tip, mo, set_view_request):
+def _(
+    card,
+    estimate_native_resolution,
+    fit_oversampling,
+    get_source,
+    help_tip,
+    mo,
+    set_view_request,
+):
     # --- Viewer controls (advanced summation tucked into an accordion) --------
     _source = get_source()
     _disabled = _source is None
     _dmin = _source.default_mz_min if _source is not None else 100.0
     _dmax = _source.default_mz_max if _source is not None else 2000.0
     _dlevel = _source.first_ms_level if _source is not None else 1
+
+    # --- Grid budget estimator -------------------------------------------
+    # Run once per loaded file: measure the native sampling resolution, then
+    # preset Oversampling to the largest value (<= 4) whose full-range sum
+    # fits inside the default bin budget. This is what stops a "Sum all" from
+    # dying on the bin cap the first time it is pressed on wide, high-R data.
+    _BIN_BUDGET = 2_000_000
+    # ~1.5 s on a large file (it decodes up to 32 spectra to find the densest),
+    # so this runs once per loaded file and the result is reused everywhere.
+    if _source is not None:
+        with mo.status.spinner(title="Estimating native sampling resolution"):
+            native_resolution = estimate_native_resolution(_source, _dmin, _dmax, _dlevel)
+    else:
+        native_resolution = None
+    _ov_default = (
+        fit_oversampling(_dmin, _dmax, native_resolution, _BIN_BUDGET, preferred=4.0)
+        if _source is not None
+        else 4.0
+    )
 
     interaction_mode = mo.ui.dropdown(
         options={"Zoom": "zoom", "Select a time window": "select"},
@@ -1722,16 +1815,16 @@ def _(card, get_source, help_tip, mo, set_view_request):
             "Fixed-Da grid": "fixed_da",
         },
         value="Automatic constant-resolution grid",
-        label="Common-grid mode",
+        label="Grid mode",
         disabled=_disabled,
     )
     oversampling_control = mo.ui.number(
-        start=1.0, stop=16.0, value=4.0, step=0.5,
+        start=1.0, stop=16.0, value=_ov_default, step=0.1,
         label="Oversampling", disabled=_disabled, full_width=True,
     )
     fixed_step_control = mo.ui.number(
         start=0.0001, value=0.01, step=0.001,
-        label="Fixed bin width (Da)", disabled=_disabled, full_width=True,
+        label="Fixed bin (Da)", disabled=_disabled, full_width=True,
     )
     profile_method_control = mo.ui.dropdown(
         options={
@@ -1740,7 +1833,7 @@ def _(card, get_source, help_tip, mo, set_view_request):
             "Legacy segmented interpolation": "legacy_linear",
         },
         value="Area-corrected profile integration",
-        label="Profile summation",
+        label="Integration",
         disabled=_disabled,
     )
     gap_factor_control = mo.ui.number(
@@ -1755,44 +1848,54 @@ def _(card, get_source, help_tip, mo, set_view_request):
         label="Max grid bins", disabled=_disabled, full_width=True,
     )
 
-    _settings = mo.accordion(
-        {
-            "Summation settings": mo.vstack(
-                [
-                    mo.hstack(
-                        [mz_min_control, help_tip("Lower edge of the common summation grid."),
-                         mz_max_control, help_tip("Upper edge of the common summation grid.")],
-                        widths=[0.44, 0.06, 0.44, 0.06], gap=0.2, align="center",
-                    ),
-                    mo.hstack(
-                        [grid_mode_control,
-                         help_tip("Automatic grid tracks native sampling; bin width grows with m/z."),
-                         profile_method_control,
-                         help_tip("Area-corrected integration is the quantitative default.")],
-                        widths=[0.44, 0.06, 0.44, 0.06], gap=0.2, align="center",
-                    ),
-                    mo.hstack(
-                        [oversampling_control,
-                         help_tip("Output bins per native sampling interval. Four is a good default."),
-                         fixed_step_control,
-                         help_tip("Used only for the Fixed-Da grid.")],
-                        widths=[0.44, 0.06, 0.44, 0.06], gap=0.2, align="center",
-                    ),
-                    mo.hstack(
-                        [gap_factor_control,
-                         help_tip("Break integration across gaps larger than this multiple of native spacing."),
-                         max_bins_control,
-                         help_tip("Ceiling on common-grid bins. Raise it for wide, high-resolution ranges; each bin costs ~24 bytes.")],
-                        widths=[0.44, 0.06, 0.44, 0.06], gap=0.2, align="center",
-                    ),
-                ],
-                gap=0.5,
-            )
-        }
+    # An accordion always renders collapsed (marimo has no default-open flag),
+    # so these settings were effectively hidden behind an unlabelled disclosure.
+    # Show them outright under a titled rule instead -- the card sits below the
+    # plots, so there is room and nothing important is pushed off screen.
+    _settings = mo.vstack(
+        [
+            mo.Html(
+                "<div style='display:flex;align-items:center;gap:10px;margin:10px 0 2px;color:#64748b;font-size:0.72rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;white-space:nowrap;'>"
+                "<span>Summation grid</span>"
+                "<span style='flex:1 1 auto;height:1px;background:#e2e8f0;'></span></div>"
+            ),
+            mo.hstack(
+                [mz_min_control, help_tip("Lower edge of the common summation grid."),
+                 mz_max_control, help_tip("Upper edge of the common summation grid.")],
+                widths=[0.44, 0.06, 0.44, 0.06], gap=0.2, align="center",
+            ),
+            mo.hstack(
+                [grid_mode_control,
+                 help_tip("Automatic grid tracks native sampling; bin width grows with m/z."),
+                 profile_method_control,
+                 help_tip("Area-corrected integration is the quantitative default.")],
+                widths=[0.44, 0.06, 0.44, 0.06], gap=0.2, align="center",
+            ),
+            mo.hstack(
+                [oversampling_control,
+                 help_tip("Output bins per native sampling interval. Preset on load so a full sum fits the bin budget."),
+                 fixed_step_control,
+                 help_tip("Used only for the Fixed-Da grid.")],
+                widths=[0.44, 0.06, 0.44, 0.06], gap=0.2, align="center",
+            ),
+            mo.hstack(
+                [gap_factor_control,
+                 help_tip("Break integration across gaps larger than this multiple of native spacing."),
+                 max_bins_control,
+                 help_tip("Ceiling on common-grid bins. Raise it for wide, high-resolution ranges; each bin costs ~24 bytes.")],
+                widths=[0.44, 0.06, 0.44, 0.06], gap=0.2, align="center",
+            ),
+        ],
+        gap=0.5,
     )
 
     _nowrap = {"white-space": "nowrap"}
     controls_card = card(
+        mo.Html(
+                "<div style='display:flex;align-items:center;gap:10px;margin:10px 0 2px;color:#64748b;font-size:0.72rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;white-space:nowrap;'>"
+                "<span>Interaction</span>"
+                "<span style='flex:1 1 auto;height:1px;background:#e2e8f0;'></span></div>"
+            ),
         mo.hstack(
             [
                 interaction_mode.style(_nowrap),
@@ -1818,6 +1921,7 @@ def _(card, get_source, help_tip, mo, set_view_request):
         interaction_mode,
         max_bins_control,
         ms_level_control,
+        native_resolution,
         mz_max_control,
         mz_min_control,
         oversampling_control,
@@ -2469,9 +2573,91 @@ def _(
 
 @app.cell
 def _(
+    fit_oversampling,
+    fixed_step_control,
+    get_source,
+    grid_mode_control,
+    max_bins_control,
+    mo,
+    mz_max_control,
+    mz_min_control,
+    native_resolution,
+    oversampling_control,
+    predict_bins,
+):
+    # --- Live grid budget -----------------------------------------------------
+    # Predicts the bin count the reader would build from the current settings, so
+    # an over-budget "Sum all" is visible before it is pressed rather than after
+    # it fails. Same formula the reader uses, so the two cannot disagree.
+    if get_source() is None:
+        grid_estimate = mo.md("")
+    else:
+        _lo = float(mz_min_control.value)
+        _hi = float(mz_max_control.value)
+        _cap = int(max_bins_control.value)
+        _ov = float(oversampling_control.value)
+        _bins = predict_bins(
+            str(grid_mode_control.value), _lo, _hi, native_resolution,
+            _ov, float(fixed_step_control.value),
+        )
+        _res = (
+            f"native sampling R &asymp; {native_resolution:,.0f}"
+            if native_resolution
+            else "native sampling resolution could not be estimated"
+        )
+        if _bins is None:
+            grid_estimate = mo.callout(mo.md(f"Grid size cannot be predicted ({_res})."), kind="neutral")
+        elif _bins <= _cap:
+            grid_estimate = mo.callout(
+                mo.md(
+                    f"**Grid budget OK.** A full sum over {_lo:,.0f}\u2013{_hi:,.0f} "
+                    f"would build **{_bins:,} bins** (~{_bins * 24 / 1024**2:,.0f} MB), "
+                    f"within the {_cap:,} ceiling. <span class='card-sub'>{_res}.</span>"
+                ),
+                kind="success",
+            )
+        else:
+            _needed = int(_bins * 1.02)
+            if str(grid_mode_control.value) == "auto_resolution":
+                _fits = fit_oversampling(_lo, _hi, native_resolution, _cap, preferred=_ov)
+                _at_fits = predict_bins(
+                    "auto_resolution", _lo, _hi, native_resolution, _fits, 1.0
+                )
+                if _at_fits is not None and _at_fits <= _cap:
+                    _advice = (
+                        f"Drop **Oversampling** to **{_fits:g}** (currently {_ov:g}), "
+                        f"or raise **Max grid bins** to about **{_needed:,}**"
+                    )
+                else:
+                    # Oversampling floors at 1, so it cannot always rescue the grid.
+                    _floor = predict_bins(
+                        "auto_resolution", _lo, _hi, native_resolution, 1.0, 1.0
+                    )
+                    _advice = (
+                        "Oversampling cannot fix this on its own — even at **1.0** the grid "
+                        f"needs **{_floor:,} bins**. Raise **Max grid bins** to at least "
+                        f"**{int(_floor * 1.02):,}**, or narrow the m/z limits"
+                    )
+            else:
+                _advice = f"Widen the fixed step, or raise **Max grid bins** to about **{_needed:,}**"
+            grid_estimate = mo.callout(
+                mo.md(
+                    f"**A full sum would fail.** It needs **{_bins:,} bins**, over the "
+                    f"{_cap:,} ceiling. {_advice}. Integrated window intensities are "
+                    "area-conserving, so a coarser grid barely changes them. "
+                    f"<span class='card-sub'>{_res}.</span>"
+                ),
+                kind="warn",
+            )
+    return (grid_estimate,)
+
+
+@app.cell
+def _(
     controls_card,
     export_card,
     get_source,
+    grid_estimate,
     mo,
     spectrum_plot,
     stats_card,
@@ -2501,6 +2687,7 @@ def _(
                 spectrum_plot,
                 mo.Html(f"<div class='plot-note'>{view_caption}</div>") if view_caption else mo.md(""),
                 controls_card,
+                grid_estimate,
             ],
             gap=0.6,
         ).style({**_col, "width": "61%"})

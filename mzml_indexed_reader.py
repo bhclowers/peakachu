@@ -6,9 +6,7 @@ memory.  The implementation supports uncompressed ``.mzML`` files, including
 ``indexedmzML`` files with random-access offsets.  Non-indexed mzML is accepted
 locally by building spectrum offsets with a memory-mapped one-time scan.
 
-Thanks Michael Marty and those supporting UniDec
-Also leveraged lessons from pyteomics. 
-
+No phase-component or Fourier-transform processing is included.
 """
 
 from __future__ import annotations
@@ -579,24 +577,40 @@ class IndexedMzMLSource:
         starts: list[int] = []
         ends: list[int] = []
         identifiers: list[str] = []
-        with self.path.open("rb") as handle:
-            with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                position = 0
-                while True:
-                    start = mm.find(b"<spectrum ", position)
-                    if start < 0:
-                        break
-                    end = mm.find(b"</spectrum>", start)
-                    if end < 0:
-                        raise MzMLIndexedReaderError("Unterminated <spectrum> element")
-                    end += len(b"</spectrum>")
-                    opening_end = mm.find(b">", start, min(end, start + 8192))
-                    opening = bytes(mm[start : opening_end + 1]) if opening_end >= 0 else b""
-                    identifier = _attrs(opening).get("id", f"spectrum={len(starts) + 1}")
-                    starts.append(start)
-                    ends.append(end)
-                    identifiers.append(identifier)
-                    position = end
+
+        # Prefer a memory-mapped scan for large local files. In some sandboxed
+        # runtimes (notably the Pyodide/WASM MEMFS used for browser deployment)
+        # mmap is unavailable, so fall back to an in-memory byte scan.
+        try:
+            with self.path.open("rb") as handle:
+                buffer: "mmap.mmap | bytes" = mmap.mmap(
+                    handle.fileno(), 0, access=mmap.ACCESS_READ
+                )
+                using_mmap = True
+        except (OSError, ValueError):
+            buffer = self.path.read_bytes()
+            using_mmap = False
+
+        try:
+            position = 0
+            while True:
+                start = buffer.find(b"<spectrum ", position)
+                if start < 0:
+                    break
+                end = buffer.find(b"</spectrum>", start)
+                if end < 0:
+                    raise MzMLIndexedReaderError("Unterminated <spectrum> element")
+                end += len(b"</spectrum>")
+                opening_end = buffer.find(b">", start, min(end, start + 8192))
+                opening = bytes(buffer[start : opening_end + 1]) if opening_end >= 0 else b""
+                identifier = _attrs(opening).get("id", f"spectrum={len(starts) + 1}")
+                starts.append(start)
+                ends.append(end)
+                identifiers.append(identifier)
+                position = end
+        finally:
+            if using_mmap:
+                buffer.close()
 
         self.spectrum_ids = tuple(identifiers)
         self.scan_numbers = np.asarray(
