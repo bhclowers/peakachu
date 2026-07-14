@@ -1747,6 +1747,13 @@ def _(card, get_source, help_tip, mo, set_view_request):
         start=2.0, stop=100.0, value=8.0, step=1.0,
         label="Gap threshold", disabled=_disabled, full_width=True,
     )
+    # The reader caps the common grid to guard memory: every bin costs ~24 B
+    # across the m/z, intensity and area arrays. 2 M bins is a sane browser
+    # default; locally there is room to raise it for wide, high-resolution runs.
+    max_bins_control = mo.ui.number(
+        start=100_000, stop=20_000_000, value=2_000_000, step=100_000,
+        label="Max grid bins", disabled=_disabled, full_width=True,
+    )
 
     _settings = mo.accordion(
         {
@@ -1773,8 +1780,10 @@ def _(card, get_source, help_tip, mo, set_view_request):
                     ),
                     mo.hstack(
                         [gap_factor_control,
-                         help_tip("Break integration across gaps larger than this multiple of native spacing.")],
-                        widths=[0.5, 0.06], gap=0.2, align="center",
+                         help_tip("Break integration across gaps larger than this multiple of native spacing."),
+                         max_bins_control,
+                         help_tip("Ceiling on common-grid bins. Raise it for wide, high-resolution ranges; each bin costs ~24 bytes.")],
+                        widths=[0.44, 0.06, 0.44, 0.06], gap=0.2, align="center",
                     ),
                 ],
                 gap=0.5,
@@ -1807,6 +1816,7 @@ def _(card, get_source, help_tip, mo, set_view_request):
         gap_factor_control,
         grid_mode_control,
         interaction_mode,
+        max_bins_control,
         ms_level_control,
         mz_max_control,
         mz_min_control,
@@ -1919,6 +1929,7 @@ def _(
     get_source,
     get_view_request,
     grid_mode_control,
+    max_bins_control,
     mo,
     ms_level_control,
     mz_max_control,
@@ -1977,6 +1988,7 @@ def _(
                         fixed_step=float(fixed_step_control.value),
                         profile_method=str(profile_method_control.value),
                         gap_factor=float(gap_factor_control.value),
+                        max_grid_points=int(max_bins_control.value),
                     )
                 spectrum_mz = _sum.mz
                 spectrum_intensity = _sum.intensity
@@ -1998,6 +2010,33 @@ def _(
                     view_signal_label = "Summed intensity density"
         except Exception as exc:  # noqa: BLE001 - surface to the plot area
             spectrum_error = str(exc)
+            # The bin-cap message tells you *that* the grid is too big but not
+            # what to do about it. Bins scale linearly with oversampling, so
+            # solve for the value that would fit and say so outright.
+            if "bins" in spectrum_error and "grid" in spectrum_error:
+                try:
+                    _cap = int(max_bins_control.value)
+                    _need = int(
+                        "".join(ch for ch in spectrum_error.split("has")[1].split("bins")[0] if ch.isdigit())
+                    )
+                    _ov = float(oversampling_control.value)
+                    # Bins scale linearly with oversampling. Take 2% headroom and
+                    # floor to 1 dp, so the suggested value genuinely fits rather
+                    # than landing exactly on the cap and rounding back over it.
+                    _fits = int(_ov * _cap / _need * 0.98 * 10) / 10.0
+                    _fits = max(1.0, _fits)
+                    _hint = (
+                        f" Oversampling {_fits:.1f} or lower would fit inside "
+                        f"{_cap:,} bins at these m/z limits"
+                        f" (currently {_ov:g})."
+                        " Raise 'Max grid bins' instead if you need the finer grid"
+                        " and have the memory."
+                        " Integrated window intensities are area-conserving, so a"
+                        " coarser grid barely changes them."
+                    )
+                    spectrum_error = spectrum_error + _hint
+                except Exception:  # noqa: BLE001 - hint is best-effort only
+                    pass
     return (
         spectrum_bin_area,
         spectrum_bin_edges,
@@ -2409,7 +2448,7 @@ def _(
             }
         ),
         mo.hstack([save_windows_button, load_windows_widget], justify="start", gap=0.5),
-        title="Extraction Windows",
+        title="Extraction windows",
         subtitle="Kept when you load another file. Save/load a set as JSON for a session.",
     )
     stats_card = card(
@@ -2596,7 +2635,7 @@ def _(
     _summary = (
         ", ".join(f"{lb} [{lo:.2f}–{hi:.2f}]" for lb, lo, hi in _windows)
         if _windows
-        else "No active windows yet — define them in the Explore & Windows tab."
+        else "No active windows yet — define them in the Explore & windows tab."
     )
     batch_panel = mo.vstack(
         [
@@ -2604,12 +2643,12 @@ def _(
                 batch_files_widget,
                 mo.hstack([batch_level_control, batch_run_button], justify="start",
                           gap=0.6, align="end"),
-                title="Batch Extraction",
+                title="Batch extraction",
                 subtitle="Applies the current extraction windows to every uploaded file.",
             ),
             card(
                 mo.Html(f"<div class='card-sub'>Active windows: {_summary}</div>"),
-                title="Windows to Extract",
+                title="Windows to extract",
             ),
             batch_results_card,
         ],
@@ -2628,19 +2667,19 @@ def _(
     mo,
     title_banner,
 ):
-    _default = "Explore & Windows" if get_source() is not None else "Load"
+    _default = "Explore & windows" if get_source() is not None else "Load"
     _tabs = mo.ui.tabs(
         {
             "Load": load_panel,
-            "Explore & Windows": explore_panel,
-            "Batch Extract": batch_panel,
+            "Explore & windows": explore_panel,
+            "Batch extract": batch_panel,
         },
         value=_default,
     )
     mo.vstack(
         [
             app_css,
-            title_banner("Peakachu", "mzML Viewer"),
+            title_banner("Peakachu", "mzML window intensity viewer"),
             _tabs,
         ],
         gap=0.4,
