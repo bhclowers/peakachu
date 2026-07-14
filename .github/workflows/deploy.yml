@@ -1,0 +1,52 @@
+name: Deploy Peakachu to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # lets you trigger a rebuild by hand from the Actions tab
+
+# Required for the Pages deployment to authenticate.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# If you push twice quickly, let the newer run win.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Only marimo is needed. `export html-wasm` bundles the notebook, it does
+      # not execute it, so numpy/pandas/plotly are NOT required in CI --
+      # Pyodide installs those in the visitor's browser at page load.
+      - name: Install marimo
+        run: pip install "marimo>=0.20"
+
+      - name: Export notebook to a static WASM site
+        run: marimo export html-wasm mzml_window_viewer.py -o site --mode run
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
